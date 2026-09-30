@@ -2,6 +2,32 @@
 
 一个把视觉任务封装成单一高层 LLM Tool `run_vision_pipeline` 的 AstrBot 插件。
 
+## v0.8 核心变化：用“网页参考图”替代长背景推理
+
+实际回归中发现，v0.7 的主要瓶颈不是 Primary Vision 看不清，而是候选整理 Worker 可能超时，并且纯文字关系很难区分“虚拟艺人 / 音乐同位体 / 剧情角色”等外观相近实体。v0.8 改为：
+
+```text
+原图
+ -> Primary Vision（regions + neutral search_terms）
+ -> 每个 region 最多一次 Tavily 搜索
+ -> 直接保留短 Search Card（title/url/snippet）
+ -> 最佳努力从结果页提取官方/页面主图
+ -> TARGET + WEB REF 拼成一张 Reference Sheet
+ -> Final Vision 一次视觉比对
+ -> 代码级 grounding / confidence gate / LOCKED_FACTS
+```
+
+不再为多人任务先调用 Search Planner 和 Candidate Synth，所以不会每次先“构造完整企划背景”。默认两人物图仍只有 2 次网页搜索、2 次 Vision 调用。
+
+### Grounding 规则
+
+- Final Vision 要确认某 region，必须选择该 region 的 `source_ref`（如 `A1`）。
+- 具体身份必须能在所选网页标题中出现；网页摘要里只出现“声源是理芽”等关系信息，不足以把参考图认成理芽。
+- 若成功取得网页参考图，Final Vision 会直接比较 TARGET 与 WEB REF。
+- 没有视觉参考时最高 `medium`；无可靠对应则 `UNRESOLVED`。
+- `UNRESOLVED` 时插件会删掉模型自行猜出的实体信息，只把直接视觉观察返回 Main。
+
+
 目标是让 Main Persona 只负责“什么时候调用视觉能力”，不再手工编排 `Vision -> Search -> Vision`，并将 OCR、候选、rank、限流状态等中间数据保存在 Python 状态机里，避免 Main 改写或丢失关键信息。
 
 ## v0.6 核心变化
@@ -257,8 +283,11 @@ Strong text anchor max queries: 2
 Multi-Region: ON
 Multi-Region contact sheet: ON
 Multi-Region max regions: 6
-Multi-Region Search Planner: ON
-Multi-Region Candidate Synth: ON
+Multi-Region Search Planner: OFF（v0.8 兼容项，不再进入关键路径）
+Multi-Region Candidate Synth: OFF（v0.8 兼容项，不再进入关键路径）
+Multi-Region Visual Reference: ON
+Reference images / region: 2
+Reference fetch timeout: 6s
 Multi-Region Strict Typed Answer: ON
 AnimeTrace multi-object: OFF
 Tavily generic fallback max queries: 3
@@ -352,7 +381,7 @@ debug_log = true
 
 启用 AnimeTrace 后，在适合专用动漫/游戏角色识别的任务中，当前图片会发送给第三方 AnimeTrace 服务用于识别。若部署环境不希望上传图片，可关闭 `animetrace_enabled`，Pipeline 会退化到 Gemini Vision + Tavily grounding。
 
-## v0.7 progressive retrieval
+## v0.7 progressive retrieval（历史说明，v0.8 已进一步简化）
 
 Multi-object identity resolution now avoids rebuilding or injecting a full background dossier on every request. The workflow stores only a lightweight source index (source name, entity types, names and works) for 7 days in AstrBot plugin data (with memory fallback). On a cache miss it uses at most two web searches: one to discover the source ecosystem and one to discover candidates from region-specific visual traits. On a cache hit it normally uses only the region-specific search.
 
@@ -360,3 +389,5 @@ The expensive final Vision call receives compact candidate cards rather than raw
 
 `pipeline.yaml` documents the intended state machine and can be reviewed independently from the implementation.
 
+
+- Multi-Region 可直接利用 Tavily per-result images 作为具名网页视觉参考。
