@@ -1,0 +1,20 @@
+name: validate
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  syntax:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Python syntax
+        run: python -m py_compile main.py prompts.py __init__.py
+      - name: Config JSON
+        run: python -m json.tool _conf_schema.json > /dev/null
+      - name: Required files
+        run: test -f metadata.yaml && test -f pipeline.yaml && test -f THIRD_PARTY_NOTICES.md
