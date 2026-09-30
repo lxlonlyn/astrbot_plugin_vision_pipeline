@@ -9,15 +9,15 @@
 ```text
 原图
  -> Primary Vision（regions + neutral search_terms）
- -> 每个 region 最多一次 Tavily 搜索
+ -> 每个 region 最多一次 Tavily 搜索（可保留 per-result images）
  -> 直接保留短 Search Card（title/url/snippet）
- -> 最佳努力从结果页提取官方/页面主图
+ -> 优先使用 Tavily 结果绑定图片；否则最佳努力提取官方/页面主图
  -> TARGET + WEB REF 拼成一张 Reference Sheet
  -> Final Vision 一次视觉比对
  -> 代码级 grounding / confidence gate / LOCKED_FACTS
 ```
 
-不再为多人任务先调用 Search Planner 和 Candidate Synth，所以不会每次先“构造完整企划背景”。默认两人物图仍只有 2 次网页搜索、2 次 Vision 调用。
+不再为多人任务先调用 Search Planner 和 Candidate Synth，所以不会每次先“构造完整企划背景”。默认两人物图仍只有 2 次网页搜索、2 次 Vision 调用。`multi_region_tavily_include_images=true` 时复用 AstrBot 全局 Tavily 多 Key 获取与结果绑定的参考图；失败会自动回退原生 Tavily。
 
 ### Grounding 规则
 
