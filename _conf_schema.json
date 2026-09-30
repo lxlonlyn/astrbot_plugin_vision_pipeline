@@ -1,0 +1,301 @@
+{
+  "vision_provider_id": {
+    "description": "Vision 模型 Provider",
+    "type": "string",
+    "default": "",
+    "hint": "必须支持图片输入。建议选择用于识图的 Gemini 3.8 Flash。留空回退当前会话模型。",
+    "_special": "select_provider"
+  },
+  "search_provider_id": {
+    "description": "Search/规划模型 Provider",
+    "type": "string",
+    "default": "",
+    "hint": "只处理文本规划、AnimeTrace rank1定向网页核验和网页结果整理，建议使用廉价模型，例如 DeepSeek Flash。",
+    "_special": "select_provider"
+  },
+  "enable_reviewer": {
+    "description": "启用廉价最终 Reviewer",
+    "type": "bool",
+    "default": true,
+    "hint": "只在最终实体身份核验后检查候选一致性，并检测‘过度谨慎弃权’；不会增加第三次 Vision 调用。"
+  },
+  "reviewer_provider_id": {
+    "description": "Reviewer Provider",
+    "type": "string",
+    "default": "",
+    "hint": "建议与 Search 模型相同。留空自动使用 Search Provider。",
+    "_special": "select_provider"
+  },
+  "reviewer_timeout_seconds": {
+    "description": "Reviewer 内部超时（秒）",
+    "type": "int",
+    "default": 12,
+    "hint": "Reviewer 只是安全网，超时/失败会直接跳过，不允许拖垮整个视觉 Tool。建议 8~15 秒。"
+  },
+  "search_worker_timeout_seconds": {
+    "description": "廉价 Search/核验 Worker 最大等待（秒）",
+    "type": "int",
+    "default": 30,
+    "hint": "限制 Search Planner/Synth/AnimeTrace 网页资料整理的单次 LLM 等待，避免接近 AstrBot 120 秒 Tool 总超时。"
+  },
+  "force_grounding_entity_identity": {
+    "description": "具体实体身份强制 grounding",
+    "type": "bool",
+    "default": true,
+    "hint": "强烈建议开启。用户问‘这是谁/哪个角色’时，不允许仅凭 Primary Vision 的模型记忆直接 FINAL；必须经过 AnimeTrace 或网页候选 grounding。"
+  },
+  "animetrace_enabled": {
+    "description": "启用 AnimeTrace 专用动漫/Galgame识别器",
+    "type": "bool",
+    "default": true,
+    "hint": "识别动漫、游戏、Galgame、二次元角色时优先调用 AnimeTrace；失败/限流会自动降级到 Tavily。"
+  },
+  "animetrace_trigger_mode": {
+    "description": "AnimeTrace 触发模式",
+    "type": "string",
+    "default": "auto",
+    "options": [
+      "auto",
+      "all_entity_identity",
+      "off"
+    ],
+    "hint": "auto：仅当 Vision 判断为动漫/游戏/二次元时调用；all_entity_identity：所有身份识别都尝试；off：关闭。"
+  },
+  "animetrace_api_url": {
+    "description": "AnimeTrace 识别 API",
+    "type": "string",
+    "default": "https://api.animetrace.com/v1/search"
+  },
+  "animetrace_model_list_url": {
+    "description": "AnimeTrace 模型列表 API",
+    "type": "string",
+    "default": "https://api.animetrace.com/v1/model/list"
+  },
+  "animetrace_model_id": {
+    "description": "AnimeTrace 模型 ID（可留空）",
+    "type": "string",
+    "default": "",
+    "hint": "建议留空：插件会动态读取当前 enabled/default 模型；模型列表暂不可用时会省略 model 参数并让服务使用默认模型。"
+  },
+  "animetrace_timeout_seconds": {
+    "description": "AnimeTrace 单次超时（秒）",
+    "type": "int",
+    "default": 25
+  },
+  "animetrace_min_interval_seconds": {
+    "description": "AnimeTrace 请求最小间隔（秒）",
+    "type": "float",
+    "default": 2.0,
+    "hint": "通过全局锁串行化专用识别请求，并至少间隔该时长，降低触发 rate limit / 服务繁忙的概率。"
+  },
+  "animetrace_cooldown_seconds": {
+    "description": "AnimeTrace 限流/繁忙冷却时间（秒）",
+    "type": "int",
+    "default": 90,
+    "hint": "遇到 HTTP 429、17702、17731 等后暂停调用，期间自动走 Tavily。"
+  },
+  "animetrace_quota_cooldown_seconds": {
+    "description": "AnimeTrace 使用上限冷却时间（秒）",
+    "type": "int",
+    "default": 600,
+    "hint": "遇到 17728（使用上限）时采用更长冷却，避免反复撞限额。"
+  },
+  "animetrace_cache_ttl_seconds": {
+    "description": "AnimeTrace 同图结果缓存（秒）",
+    "type": "int",
+    "default": 1800,
+    "hint": "同一图片在 TTL 内复用专用识别结果，不再次消耗 AnimeTrace 请求。"
+  },
+  "animetrace_model_cache_ttl_seconds": {
+    "description": "AnimeTrace 模型列表缓存（秒）",
+    "type": "int",
+    "default": 3600
+  },
+  "animetrace_max_candidates": {
+    "description": "AnimeTrace 总候选最多保留数量",
+    "type": "int",
+    "default": 6
+  },
+  "animetrace_max_candidates_per_box": {
+    "description": "AnimeTrace 每个人物框最多保留候选",
+    "type": "int",
+    "default": 3
+  },
+  "animetrace_max_file_mb": {
+    "description": "发送给 AnimeTrace 的图片最大 MB",
+    "type": "int",
+    "default": 10,
+    "hint": "超过时跳过 AnimeTrace 并降级到通用 grounding，不影响 Gemini Vision。"
+  },
+  "animetrace_web_enrich_when_uncertain": {
+    "description": "AnimeTrace not_confident 时做一次定向网页核验",
+    "type": "bool",
+    "default": true,
+    "hint": "仅核实 rank1 的姓名/作品真实性并补充中文名；不会再把 AnimeTrace 候选交给通用 Search Synth 重排。"
+  },
+  "animetrace_rank1_fallback_medium": {
+    "description": "AnimeTrace rank1 无外部硬冲突时至少保留为中等置信度",
+    "type": "bool",
+    "default": true,
+    "hint": "仅对 not_confident=false 的 AnimeTrace rank1 生效；低置信、强文字锚点冲突、多对象任务不会强制保底。"
+  },
+  "animetrace_resolve_chinese_names": {
+    "description": "尽量补充 AnimeTrace 候选中文名",
+    "type": "bool",
+    "default": true,
+    "hint": "AnimeTrace 常返回日文名。开启后会在 rank1 的定向网页核验中尝试取得可靠中文名；未找到可靠来源时保留日文原名，不自行音译猜测。"
+  },
+  "animetrace_name_cache_ttl_seconds": {
+    "description": "AnimeTrace 候选中文名/资料核验缓存（秒）",
+    "type": "int",
+    "default": 86400,
+    "hint": "同一候选的中文名与作品核验默认缓存 24 小时，减少重复 Tavily 调用。"
+  },
+  "max_search_queries": {
+    "description": "AnimeTrace 无候选时的通用 grounding 最多网页搜索次数",
+    "type": "int",
+    "default": 3,
+    "hint": "代码硬限制为 1~3。AnimeTrace 一旦有候选不会进入通用 Search Synth；not_confident 最多只做 1 次 rank1 定向网页核验。"
+  },
+  "enable_extract": {
+    "description": "允许最多一次 Tavily 网页正文提取",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭；仅 AnimeTrace 无候选、进入通用网页 fallback 后才可能使用。"
+  },
+  "tavily_search_depth": {
+    "description": "Tavily 搜索深度",
+    "type": "string",
+    "default": "basic",
+    "options": [
+      "basic",
+      "advanced"
+    ]
+  },
+  "tavily_max_results": {
+    "description": "每次 Tavily 返回结果数",
+    "type": "int",
+    "default": 5
+  },
+  "max_search_items": {
+    "description": "传给 Search 模型的每次搜索最大条目数",
+    "type": "int",
+    "default": 5
+  },
+  "max_snippet_chars": {
+    "description": "每条搜索摘要最大字符数",
+    "type": "int",
+    "default": 700
+  },
+  "max_extract_chars": {
+    "description": "网页提取内容最大字符数",
+    "type": "int",
+    "default": 5000
+  },
+  "max_images": {
+    "description": "单次流水线最多处理图片数",
+    "type": "int",
+    "default": 2
+  },
+  "tool_timeout": {
+    "description": "单次 Tavily 工具超时（秒）",
+    "type": "int",
+    "default": 45
+  },
+  "strong_text_anchor_search": {
+    "description": "强文字锚点触发混合 grounding",
+    "type": "bool",
+    "default": true,
+    "hint": "当 Primary OCR 到版权、Studio、企划、作品名、Logo 等强线索时，即使 AnimeTrace 有候选，也会做少量 OCR-led Search 并与 AnimeTrace 并列交给 Final Vision。"
+  },
+  "strong_text_anchor_max_search_queries": {
+    "description": "强文字锚点最多网页搜索次数",
+    "type": "int",
+    "default": 2,
+    "hint": "硬限制为 1~2 次，避免强文本分支变成长链路。"
+  },
+  "multi_region_enabled": {
+    "description": "启用多人/多物品/货架 Multi-Region 模式",
+    "type": "bool",
+    "default": true,
+    "hint": "Primary Vision 一次定位主要区域；插件本地裁剪并拼成 Contact Sheet；Final Vision 一次识别所有区域，不为每个对象启动完整 Pipeline。"
+  },
+  "multi_region_contact_sheet": {
+    "description": "Multi-Region 使用本地 Contact Sheet",
+    "type": "bool",
+    "default": true,
+    "hint": "将整图缩略图和若干局部裁剪拼成一张图交给最终 Vision，减少重复系统提示和多次视觉调用。"
+  },
+  "multi_region_max_regions": {
+    "description": "Multi-Region 最多区域数",
+    "type": "int",
+    "default": 6,
+    "hint": "建议 4~8；过多会导致 Contact Sheet 过密并提高图像 token。"
+  },
+  "multi_region_max_search_queries": {
+    "description": "Multi-Region 整图级最多网页搜索次数",
+    "type": "int",
+    "default": 2,
+    "hint": "只做全局 OCR/版权/企划检索，不为每个 crop 重复搜索。"
+  },
+  "multi_region_search_planner": {
+    "description": "Multi-Region 使用廉价 Search Planner 生成消歧查询",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。只调用廉价文本模型一次，避免两个搜索名额都浪费在重复版权字符串；会主动区分虚拟艺人/音乐同位体/作品角色等实体层级。"
+  },
+  "multi_region_candidate_synth": {
+    "description": "Multi-Region 将网页结果整理为按区域候选池",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。廉价文本模型把网页结果整理成每个 region 的具名候选，并区分 visual identity / entity type / related entities，再交给最终 Vision。"
+  },
+  "source_index_cache_ttl_seconds": {
+    "description": "来源生态轻量索引缓存时间（秒）",
+    "type": "int",
+    "default": 604800,
+    "hint": "默认7天，持久化保存到 AstrBot data/plugin_data/astrbot_plugin_vision_pipeline/source_index_cache.json。只缓存来源名、实体类型、实体名和作品字段，不缓存网页全文；命中后 Multi-Region 通常只需1次 region-specific 搜索。"
+  },
+  "multi_region_strict_typed_answer": {
+    "description": "Multi-Region 最终答案使用结构化实体渲染",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。最终展示以 visual_identity 为准，不允许用“艺人/同位体/剧情角色”斜杠合并成同一身份。"
+  },
+  "multi_region_padding_x": {
+    "description": "区域裁剪水平扩边比例",
+    "type": "float",
+    "default": 0.12,
+    "hint": "保留周边服装/配件，避免框太紧。"
+  },
+  "multi_region_padding_top": {
+    "description": "区域裁剪顶部扩边比例",
+    "type": "float",
+    "default": 0.3,
+    "hint": "动漫角色建议较大顶部扩边以保留 Halo、帽子、兽耳等身份特征。"
+  },
+  "multi_region_padding_bottom": {
+    "description": "区域裁剪底部扩边比例",
+    "type": "float",
+    "default": 0.15,
+    "hint": "保留领带、制服、商品底座等区分特征。"
+  },
+  "animetrace_multi_object_enabled": {
+    "description": "多人/多物品任务也调用 AnimeTrace",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭。AnimeTrace 有人物数量限制且不适用于一般货架物品；开启后也仅作辅助候选，不作为裁剪/分割唯一来源。"
+  },
+  "return_debug_meta": {
+    "description": "在 Tool Result 中返回调用计数 META",
+    "type": "bool",
+    "default": false,
+    "hint": "调试阶段建议打开；稳定后关闭以减少 Main 输入。META 会显示 AnimeTrace/Tavily/Vision 路径。"
+  },
+  "debug_log": {
+    "description": "在 AstrBot 日志记录流水线结构化阶段数据",
+    "type": "bool",
+    "default": false,
+    "hint": "排错时打开；日志可能包含用户任务文本和候选信息。"
+  }
+}

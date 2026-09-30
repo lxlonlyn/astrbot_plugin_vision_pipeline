@@ -1,0 +1,7 @@
+name: astrbot_plugin_vision_pipeline
+display_name: Vision Pipeline + AnimeTrace
+short_desc: 将视觉识别、渐进式来源检索、AnimeTrace辅助候选、多区域/货架识别、开放候选发现、实体类型消歧与最终复核封装为单一高层 Tool。
+desc: 面向 AstrBot 的独立视觉状态机。Main 只调用 run_vision_pipeline；插件只读取当前消息或当前 Reply 明确携带的图片，不复用历史旧图。内部支持 Primary Vision、强 OCR/版权/Studio 文本锚点、AnimeTrace 辅助候选与限流/容量降级、多人/多物品 Multi-Region + Contact Sheet、渐进式 source-universe / region candidate 检索、轻量来源索引缓存、实体类型/关联关系消歧、Final Vision Verify、可选廉价 Reviewer、LOCKED_FACTS 与中文名补充，不修改 AstrBot 核心源码。
+version: v0.7.0
+author: OpenAI-assisted local plugin
+astrbot_version: ">=4.28,<5"

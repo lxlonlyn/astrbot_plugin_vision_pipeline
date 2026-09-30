@@ -1,0 +1,65 @@
+pipeline:
+  name: vision_entity_resolution
+  version: "0.7"
+  principles:
+    - current_image_only
+    - open_candidate_discovery
+    - progressive_retrieval
+    - visual_identity_separate_from_related_entities
+    - cheap_search_compact_output
+    - expensive_vision_max_two_calls
+  image_input:
+    accept:
+      - current_message_image
+      - explicit_current_reply_image
+    reject:
+      - historical_image_guessing
+      - temp_directory_guessing
+      - implicit_previous_image_reuse
+    on_missing: ask_user_to_attach_image
+  stages:
+    - primary_vision:
+        outputs:
+          - ocr
+          - strong_text_anchors
+          - discriminative_visual_traits
+          - named_regions
+        candidate_hints_are_weak: true
+    - route:
+        simple_visual: direct_report
+        single_anime_entity: animetrace_optional
+        multi_object: multi_region_pipeline
+        other_entity: web_grounding
+    - multi_region_pipeline:
+        source_index_cache:
+          ttl_seconds: 604800
+          stores_only: [source_name, entity_types, entity_names, work]
+        search:
+          cache_miss_max_queries: 2
+          cache_hit_max_queries: 1
+          query_1: source_ecosystem_discovery
+          query_2: region_visual_candidate_discovery
+          forbid_primary_guess_names: true
+        candidate_cards:
+          max_per_region: 3
+          fields:
+            - canonical_name
+            - display_name
+            - entity_type
+            - work
+            - visual_traits
+            - source_url
+            - related_entities
+        final_vision:
+          max_calls: 1
+          allow: [MATCH, NONE_OF_ABOVE, UNRESOLVED]
+          high_confidence_requires:
+            - external_visual_traits_present
+            - at_least_two_visual_matches
+          relation_only_grounding_confidence_ceiling: medium
+    - reviewer:
+        enabled: true
+        fail_soft: true
+        may_not_create_identity: true
+    - report:
+        use_locked_facts: true
