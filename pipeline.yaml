@@ -1,12 +1,13 @@
 pipeline:
   name: vision_entity_resolution
-  version: "0.7"
+  version: "0.8"
   principles:
     - current_image_only
     - open_candidate_discovery
-    - progressive_retrieval
+    - region_specific_search
+    - visual_reference_matching
     - visual_identity_separate_from_related_entities
-    - cheap_search_compact_output
+    - unresolved_hygiene
     - expensive_vision_max_two_calls
   image_input:
     accept:
@@ -22,43 +23,71 @@ pipeline:
         outputs:
           - ocr
           - strong_text_anchors
-          - discriminative_visual_traits
           - named_regions
+          - discriminative_visual_traits
+          - neutral_search_terms
         candidate_hints_are_weak: true
+        search_terms_must_not_contain_guessed_identity: true
     - route:
         simple_visual: direct_report
         single_anime_entity: animetrace_optional
-        multi_object: multi_region_pipeline
+        multi_object: multi_region_reference_pipeline
         other_entity: web_grounding
-    - multi_region_pipeline:
-        source_index_cache:
-          ttl_seconds: 604800
-          stores_only: [source_name, entity_types, entity_names, work]
+    - multi_region_reference_pipeline:
         search:
-          cache_miss_max_queries: 2
-          cache_hit_max_queries: 1
-          query_1: source_ecosystem_discovery
-          query_2: region_visual_candidate_discovery
+          max_queries: 2
+          strategy: one_query_per_region
           forbid_primary_guess_names: true
-        candidate_cards:
+          source_anchor_is_scope_not_identity: true
+        search_cards:
+          generated_by_code: true
           max_per_region: 3
-          fields:
-            - canonical_name
-            - display_name
-            - entity_type
-            - work
-            - visual_traits
-            - source_url
-            - related_entities
+          fields: [source_ref, title, url, snippet]
+          text_llm_planner: false
+          text_llm_candidate_synth: false
+        web_reference_images:
+          enabled: true
+          tavily_per_result_images: true
+          reuse_astrbot_tavily_key_pool: true
+          max_per_region: 2
+          sources:
+            - tavily_result_image
+            - og:image
+            - twitter:image
+            - image_src
+            - page_img
+          failure_mode: fall_back_to_text_cards_and_contact_sheet
+        comparison_sheet:
+          contains:
+            - original_overview
+            - region_target_crops
+            - labeled_web_reference_images
+          final_vision_calls: 1
         final_vision:
-          max_calls: 1
-          allow: [MATCH, NONE_OF_ABOVE, UNRESOLVED]
+          allow: [MATCH, UNRESOLVED]
+          match_requires:
+            - valid_region_source_ref
+            - exact_identity_text_in_selected_card_title
           high_confidence_requires:
-            - external_visual_traits_present
+            - selected_card_has_reference_image
             - at_least_two_visual_matches
-          relation_only_grounding_confidence_ceiling: medium
+          text_only_grounding_confidence_ceiling: medium
+    - code_gate:
+        unresolved:
+          clear:
+            - guessed_identity
+            - guessed_work
+            - guessed_related_entities
+            - entity_claims_in_evidence
+          preserve:
+            - direct_primary_visual_observations
+            - exact_ocr
+        locked_facts:
+          multi_status: [MULTI_CONFIRMED, MULTI_PARTIAL, MULTI_UNCONFIRMED]
+          per_region_status: true
+          do_not_infer_flag_when_any_unresolved: true
     - reviewer:
-        enabled: true
+        enabled_for_single_entity: true
         fail_soft: true
         may_not_create_identity: true
     - report:
