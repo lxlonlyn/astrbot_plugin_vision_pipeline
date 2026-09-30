@@ -226,6 +226,30 @@
     "default": true,
     "hint": "将整图缩略图和若干局部裁剪拼成一张图交给最终 Vision，减少重复系统提示和多次视觉调用。"
   },
+  "multi_region_visual_reference_enabled": {
+    "description": "Multi-Region 从网页页面提取视觉参考图",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。对每个 region 的搜索结果页最佳努力提取 og:image/页面主图，并与 TARGET 裁剪拼成一张比较图。失败时自动回退普通 Contact Sheet。"
+  },
+  "multi_region_tavily_include_images": {
+    "description": "Multi-Region Tavily 搜索保留网页关联图片",
+    "type": "bool",
+    "default": true,
+    "hint": "建议开启。直接复用 AstrBot 全局 Tavily 多 Key，调用同一 Search API 的 include_images；只为 Multi-Region 候选卡提供视觉参考，不增加 Vision 调用次数。失败自动回退普通 AstrBot Tavily/网页主图抓取。"
+  },
+  "multi_region_reference_images_per_region": {
+    "description": "每个 Region 最多网页参考图数量",
+    "type": "int",
+    "default": 2,
+    "hint": "建议 1~2。更多参考图会增大比较图，但仍只产生一次 Final Vision 调用。"
+  },
+  "multi_region_reference_fetch_timeout_seconds": {
+    "description": "单个网页/参考图抓取超时（秒）",
+    "type": "int",
+    "default": 6,
+    "hint": "仅网络抓图，不调用 LLM；超时或失败直接跳过，不拖垮 Pipeline。"
+  },
   "multi_region_max_regions": {
     "description": "Multi-Region 最多区域数",
     "type": "int",
@@ -236,19 +260,19 @@
     "description": "Multi-Region 整图级最多网页搜索次数",
     "type": "int",
     "default": 2,
-    "hint": "只做全局 OCR/版权/企划检索，不为每个 crop 重复搜索。"
+    "hint": "默认2次：优先按 region 各搜索一次，而不是先重建整个企划背景。Primary Vision 提供不含角色名的 search_terms。"
   },
   "multi_region_search_planner": {
-    "description": "Multi-Region 使用廉价 Search Planner 生成消歧查询",
+    "description": "兼容项：旧版 Multi-Region Search Planner",
     "type": "bool",
-    "default": true,
-    "hint": "建议开启。只调用廉价文本模型一次，避免两个搜索名额都浪费在重复版权字符串；会主动区分虚拟艺人/音乐同位体/作品角色等实体层级。"
+    "default": false,
+    "hint": "v0.8 默认不再进入关键路径；Primary Vision 直接给出 neutral search_terms，插件按 region 组成查询，减少一次文本 LLM。"
   },
   "multi_region_candidate_synth": {
-    "description": "Multi-Region 将网页结果整理为按区域候选池",
+    "description": "兼容项：旧版 Multi-Region Candidate Synth",
     "type": "bool",
-    "default": true,
-    "hint": "建议开启。廉价文本模型把网页结果整理成每个 region 的具名候选，并区分 visual identity / entity type / related entities，再交给最终 Vision。"
+    "default": false,
+    "hint": "v0.8 默认关闭且不进入关键路径；网页结果直接变成带 source_ref 的短 Search Card，避免 Synth 超时与长输出。"
   },
   "source_index_cache_ttl_seconds": {
     "description": "来源生态轻量索引缓存时间（秒）",
