@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import hashlib
+import html as html_lib
 import io
 import json
 import mimetypes
@@ -72,6 +73,10 @@ class VisionPipelinePlugin(Star):
 
         # AnimeTrace state.
         self._http_session: aiohttp.ClientSession | None = None
+        # Shared AstrBot Tavily keys are also reused for optional image-enriched search.
+        # Keep an independent round-robin cursor; auth/quota/rate-limit errors fail over to the next key.
+        self._tavily_key_lock = asyncio.Lock()
+        self._tavily_key_index = 0
         self._animetrace_lock = asyncio.Lock()
         self._animetrace_last_call_at = 0.0
         self._animetrace_cooldown_until = 0.0
@@ -94,7 +99,7 @@ class VisionPipelinePlugin(Star):
             self._load_source_index_cache()
         except Exception as exc:  # noqa: BLE001
             logger.warning("[vision-pipeline] source index cache init failed; using memory only: %s", exc)
-        logger.info("Vision Pipeline v0.7.0 loaded (progressive source discovery + compact region candidate grounding + typed multi-region verify)")
+        logger.info("Vision Pipeline v0.8.0 loaded (region-specific retrieval + web visual references + strict unresolved hygiene)")
 
     async def terminate(self):
         if self._http_session and not self._http_session.closed:
@@ -568,6 +573,406 @@ class VisionPipelinePlugin(Star):
         )
 
 
+
+    def _source_search_label(self, primary: dict[str, Any]) -> str:
+        """Return a short neutral source anchor for web queries.
+
+        Copyright lines may contain years and corporate wrappers. Prefer a studio/project
+        phrase if visible; otherwise use the existing normalized source-cache key.
+        """
+        anchors = self._strong_text_anchors(primary)
+        for raw in anchors:
+            text = str(raw or "").strip()
+            m = re.search(r"([A-Z0-9][A-Z0-9 .&'_-]{2,}?(?:STUDIO|PROJECT|PRODUCTION))", text, re.I)
+            if m:
+                return re.sub(r"\s+", " ", m.group(1)).strip()[:120]
+        key = self._source_cache_key(anchors)
+        return key[:120]
+
+    def _multi_region_search_requests(self, primary: dict[str, Any]) -> list[dict[str, str]]:
+        """Build one open-discovery query per region without a text-planner LLM.
+
+        v0.8 deliberately spends the web-search budget on the actual regions instead of
+        rebuilding an abstract source universe first. Primary Vision supplies short neutral
+        search_terms, so no guessed character names are injected here.
+        """
+        budget = self._multi_region_max_search_queries()
+        if budget <= 0:
+            return []
+        source = self._source_search_label(primary)
+        regions = [
+            x for x in (primary.get("regions") or [])
+            if isinstance(x, dict) and str(x.get("kind") or "") not in {"text", "screen"}
+        ]
+        out: list[dict[str, str]] = []
+        for row in regions:
+            if len(out) >= budget:
+                break
+            rid = str(row.get("region_id") or "").strip()[:16]
+            terms = self._clean_list(row.get("search_terms", []))[:5]
+            # Defensive guard: even if Primary violated the prompt, guessed names must not
+            # silently become query constraints.
+            guessed = [re.sub(r"\s+", "", x).casefold() for x in self._clean_list(primary.get("possible_leads", []))]
+            terms = [
+                t for t in terms
+                if not any(g and g in re.sub(r"\s+", "", t).casefold() for g in guessed)
+            ]
+            if not terms:
+                # Backward-compatible fallback for providers that ignored search_terms.
+                for obs in self._clean_list(row.get("direct_observations", []))[:3]:
+                    compact = re.sub(r"[，。；、,:：;（）()\[\]{}]", " ", obs)
+                    compact = re.sub(r"\s+", " ", compact).strip()
+                    if compact:
+                        terms.append(compact[:42])
+            if not terms:
+                continue
+            prefix = f'"{source}" ' if source else ""
+            query = prefix + " ".join(terms[:4]) + " 公式 キャラクター 立ち絵"
+            out.append({"region_id": rid, "query": query[:320]})
+        if not out and source:
+            out.append({"region_id": "GLOBAL", "query": f'"{source}" キャラクター 公式 立ち絵'})
+        return out[:budget]
+
+    @staticmethod
+    def _basic_public_http_url(url: str) -> bool:
+        try:
+            parsed = urllib.parse.urlparse(url)
+            if parsed.scheme not in {"http", "https"}:
+                return False
+            host = (parsed.hostname or "").strip().lower()
+            if not host or host in {"localhost", "localhost.localdomain"}:
+                return False
+            if host.startswith(("127.", "10.", "192.168.", "169.254.")):
+                return False
+            if host.startswith("172."):
+                try:
+                    second = int(host.split(".")[1])
+                    if 16 <= second <= 31:
+                        return False
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            return False
+
+    def _parse_search_cards(
+        self,
+        text: str,
+        *,
+        region_id: str,
+        query: str,
+        source_label: str,
+    ) -> list[dict[str, Any]]:
+        """Turn Tavily JSON into small deterministic cards; no synth LLM required."""
+        try:
+            data = json.loads(text)
+            rows = data.get("results", []) if isinstance(data, dict) else []
+        except Exception:
+            rows = []
+        cleaned: list[tuple[float, int, dict[str, Any]]] = []
+        source_tokens = [x.casefold() for x in re.findall(r"[A-Za-z0-9]{4,}", source_label or "")]
+        for idx, row in enumerate(rows[:8]):
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title") or "").strip()[:220]
+            url = str(row.get("url") or "").strip()[:1200]
+            snippet = str(row.get("snippet") or row.get("content") or "").strip()[:360]
+            if not title or not url or not self._basic_public_http_url(url):
+                continue
+            hay = f"{title} {url} {snippet}".casefold()
+            score = float(8 - idx)
+            netloc = (urllib.parse.urlparse(url).hostname or "").casefold()
+            if source_tokens and any(tok in netloc or tok in hay for tok in source_tokens):
+                score += 3.0
+            if any(x in hay for x in ["公式", "official", "product", "artist", "character"]):
+                score += 1.0
+            image_urls: list[str] = []
+            raw_images = row.get("images") if isinstance(row.get("images"), list) else []
+            for raw_img in raw_images[:8]:
+                if isinstance(raw_img, str):
+                    img_url = raw_img.strip()
+                elif isinstance(raw_img, dict):
+                    img_url = str(raw_img.get("url") or "").strip()
+                else:
+                    img_url = ""
+                if img_url and self._basic_public_http_url(img_url) and img_url not in image_urls:
+                    image_urls.append(img_url)
+            cleaned.append((score, idx, {"title": title, "url": url, "snippet": snippet, "image_urls": image_urls}))
+        cleaned.sort(key=lambda x: (-x[0], x[1]))
+        cards = []
+        for n, (_score, _idx, row) in enumerate(cleaned[:3], start=1):
+            ref_id = f"{region_id}{n}" if region_id and region_id != "GLOBAL" else f"S{n}"
+            cards.append({
+                "source_ref": ref_id,
+                "region_id": region_id,
+                "query": query[:220],
+                "title": row["title"],
+                "url": row["url"],
+                "snippet": row["snippet"],
+                "image_urls": list(row.get("image_urls") or [])[:4],
+                "reference_image_available": False,
+            })
+        return cards
+
+    @staticmethod
+    def _html_image_candidates(html_text: str, base_url: str) -> list[str]:
+        """Extract likely representative images from a public HTML page."""
+        out: list[str] = []
+        for tag in re.findall(r"<meta\b[^>]*>", html_text, flags=re.I):
+            attrs = {
+                k.lower(): html_lib.unescape(v)
+                for k, v in re.findall(r"([:\w.-]+)\s*=\s*[\"']([^\"']*)[\"']", tag)
+            }
+            key = (attrs.get("property") or attrs.get("name") or "").lower()
+            if key in {"og:image", "og:image:secure_url", "twitter:image", "twitter:image:src"}:
+                value = attrs.get("content") or ""
+                if value:
+                    out.append(urllib.parse.urljoin(base_url, value))
+        for tag in re.findall(r"<link\b[^>]*>", html_text, flags=re.I):
+            attrs = {
+                k.lower(): html_lib.unescape(v)
+                for k, v in re.findall(r"([:\w.-]+)\s*=\s*[\"']([^\"']*)[\"']", tag)
+            }
+            if "image_src" in (attrs.get("rel") or "").lower() and attrs.get("href"):
+                out.append(urllib.parse.urljoin(base_url, attrs["href"]))
+        for tag in re.findall(r"<img\b[^>]*>", html_text, flags=re.I)[:24]:
+            attrs = {
+                k.lower(): html_lib.unescape(v)
+                for k, v in re.findall(r"([:\w.-]+)\s*=\s*[\"']([^\"']*)[\"']", tag)
+            }
+            value = attrs.get("src") or attrs.get("data-src") or ""
+            if value and not value.startswith("data:"):
+                out.append(urllib.parse.urljoin(base_url, value))
+        dedup: list[str] = []
+        for url in out:
+            if url not in dedup:
+                dedup.append(url)
+        return dedup[:12]
+
+    async def _download_public_reference_image(self, url: str, ref_id: str) -> str:
+        if not self._basic_public_http_url(url):
+            return ""
+        session = await self._ensure_http_session()
+        timeout_s = max(2, min(12, int(self.config.get("multi_region_reference_fetch_timeout_seconds", 6) or 6)))
+        try:
+            async with session.get(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 VisionPipeline/0.8"},
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status != 200 or not self._basic_public_http_url(str(resp.url)):
+                    return ""
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "image" not in ctype:
+                    return ""
+                data = await resp.content.read(5 * 1024 * 1024 + 1)
+                if not data or len(data) > 5 * 1024 * 1024:
+                    return ""
+            im = ImageOps.exif_transpose(PILImage.open(io.BytesIO(data))).convert("RGB")
+            if min(im.size) < 120:
+                return ""
+            out_dir = Path(tempfile.gettempdir()) / "astrbot_vision_refs"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            path = out_dir / f"ref_{re.sub(r'[^A-Za-z0-9_-]', '', ref_id)[:16]}_{hashlib.md5(data).hexdigest()[:10]}.jpg"
+            im.thumbnail((900, 900), PILImage.Resampling.LANCZOS)
+            im.save(path, format="JPEG", quality=90, optimize=True)
+            return str(path.resolve())
+        except Exception:
+            return ""
+
+    async def _fetch_reference_image_for_card(self, card: dict[str, Any]) -> str:
+        # Tavily can return per-result images directly. Prefer those because they stay
+        # attached to a named search result and avoid fragile page HTML extraction.
+        for image_url in list(card.get("image_urls") or [])[:4]:
+            path = await self._download_public_reference_image(
+                str(image_url), str(card.get("source_ref") or "R")
+            )
+            if path:
+                return path
+
+        page_url = str(card.get("url") or "")
+        if not self._basic_public_http_url(page_url):
+            return ""
+        session = await self._ensure_http_session()
+        timeout_s = max(2, min(12, int(self.config.get("multi_region_reference_fetch_timeout_seconds", 6) or 6)))
+        try:
+            async with session.get(
+                page_url,
+                headers={"User-Agent": "Mozilla/5.0 VisionPipeline/0.8"},
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=timeout_s),
+            ) as resp:
+                if resp.status != 200 or not self._basic_public_http_url(str(resp.url)):
+                    return ""
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                if "image" in ctype:
+                    return await self._download_public_reference_image(str(resp.url), str(card.get("source_ref") or "R"))
+                raw = await resp.content.read(800_000)
+                encoding = resp.charset or "utf-8"
+                html_text = raw.decode(encoding, errors="ignore")
+                base = str(resp.url)
+        except Exception:
+            return ""
+
+        best_path = ""
+        best_area = 0
+        for img_url in self._html_image_candidates(html_text, base)[:6]:
+            path = await self._download_public_reference_image(img_url, str(card.get("source_ref") or "R"))
+            if not path:
+                continue
+            try:
+                with PILImage.open(path) as im:
+                    w, h = im.size
+                    aspect = max(w, h) / max(1, min(w, h))
+                    if aspect > 4.5:
+                        Path(path).unlink(missing_ok=True)
+                        continue
+                    area = w * h
+            except Exception:
+                Path(path).unlink(missing_ok=True)
+                continue
+            if area > best_area:
+                if best_path:
+                    Path(best_path).unlink(missing_ok=True)
+                best_path = path
+                best_area = area
+            else:
+                Path(path).unlink(missing_ok=True)
+            if best_area >= 500 * 500:
+                break
+        return best_path
+
+    async def _attach_reference_images(self, card_rows: list[dict[str, Any]]) -> list[str]:
+        if not bool(self.config.get("multi_region_visual_reference_enabled", True)):
+            return []
+        per_region = max(1, min(3, int(self.config.get("multi_region_reference_images_per_region", 2) or 2)))
+        selected: list[dict[str, Any]] = []
+        seen: dict[str, int] = {}
+        for card in card_rows:
+            rid = str(card.get("region_id") or "")
+            if seen.get(rid, 0) >= per_region:
+                continue
+            selected.append(card)
+            seen[rid] = seen.get(rid, 0) + 1
+        if not selected:
+            return []
+
+        async def one(card: dict[str, Any]) -> str:
+            path = await self._fetch_reference_image_for_card(card)
+            if path:
+                card["reference_image_available"] = True
+                card["_reference_image_path"] = path
+            return path
+
+        paths = await asyncio.gather(*(one(card) for card in selected), return_exceptions=False)
+        return [p for p in paths if p]
+
+    def _crop_region_pil(self, im: PILImage.Image, reg: dict[str, Any]) -> PILImage.Image | None:
+        coords = self._region_box_xyxy(reg)
+        if not coords:
+            return None
+        w, h = im.size
+        left, top, right, bottom = [x / 1000.0 for x in coords]
+        x1, y1, x2, y2 = left * w, top * h, right * w, bottom * h
+        rw, rh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        pad_x_ratio = max(0.0, min(0.5, float(self.config.get("multi_region_padding_x", 0.12) or 0.12)))
+        pad_top_ratio = max(0.0, min(0.7, float(self.config.get("multi_region_padding_top", 0.30) or 0.30)))
+        pad_bottom_ratio = max(0.0, min(0.5, float(self.config.get("multi_region_padding_bottom", 0.15) or 0.15)))
+        x1 -= rw * pad_x_ratio
+        x2 += rw * pad_x_ratio
+        y1 -= rh * pad_top_ratio
+        y2 += rh * pad_bottom_ratio
+        box = (max(0, int(x1)), max(0, int(y1)), min(w, int(x2)), min(h, int(y2)))
+        if box[2] <= box[0] or box[3] <= box[1]:
+            return None
+        return im.crop(box)
+
+    async def _build_reference_sheet(
+        self,
+        image_ref: str,
+        regions: list[dict[str, Any]],
+        cards: list[dict[str, Any]],
+    ) -> str:
+        """Compose TARGET crops and web reference thumbnails into one image call."""
+        data, _filename, _ctype = await self._read_image_bytes(image_ref)
+        im = ImageOps.exif_transpose(PILImage.open(io.BytesIO(data))).convert("RGB")
+        if not regions:
+            return ""
+        by_region: dict[str, list[dict[str, Any]]] = {}
+        for card in cards:
+            if card.get("_reference_image_path"):
+                by_region.setdefault(str(card.get("region_id") or ""), []).append(card)
+
+        sheet_w = 1440
+        margin = 18
+        overview_h = 240
+        overview = im.copy()
+        overview.thumbnail((sheet_w - 2 * margin, overview_h), PILImage.Resampling.LANCZOS)
+        row_h = 360
+        sheet_h = margin + 34 + overview.height + margin + len(regions) * (row_h + margin)
+        canvas = PILImage.new("RGB", (sheet_w, sheet_h), "white")
+        draw = ImageDraw.Draw(canvas)
+        draw.text((margin, 8), "ORIGINAL OVERVIEW", fill="black")
+        canvas.paste(overview, ((sheet_w - overview.width) // 2, margin + 34))
+        y = margin + 34 + overview.height + margin
+        target_w = 430
+        ref_w = 430
+
+        for reg in regions:
+            rid = str(reg.get("region_id") or "A")
+            target = self._crop_region_pil(im, reg)
+            if target is None:
+                y += row_h + margin
+                continue
+            target.thumbnail((target_w - 20, row_h - 52), PILImage.Resampling.LANCZOS)
+            draw.rectangle((margin, y, margin + target_w, y + row_h), outline="black", width=2)
+            draw.text((margin + 10, y + 8), f"{rid} TARGET", fill="black")
+            canvas.paste(target, (margin + (target_w - target.width)//2, y + 40 + max(0,(row_h-48-target.height)//2)))
+
+            refs = by_region.get(rid, [])[:2]
+            for j, card in enumerate(refs):
+                x = margin + target_w + margin + j * (ref_w + margin)
+                draw.rectangle((x, y, x + ref_w, y + row_h), outline="black", width=2)
+                draw.text((x + 10, y + 8), f"{card.get('source_ref')} WEB REF", fill="black")
+                try:
+                    rim = ImageOps.exif_transpose(PILImage.open(str(card.get("_reference_image_path")))).convert("RGB")
+                    rim.thumbnail((ref_w - 20, row_h - 52), PILImage.Resampling.LANCZOS)
+                    canvas.paste(rim, (x + (ref_w-rim.width)//2, y + 40 + max(0,(row_h-48-rim.height)//2)))
+                except Exception:
+                    pass
+            y += row_h + margin
+
+        out_dir = Path(tempfile.gettempdir())
+        out_path = out_dir / f"vision_pipeline_refs_{int(time.time()*1000)}_{hashlib.md5(data).hexdigest()[:8]}.jpg"
+        canvas.save(out_path, format="JPEG", quality=90, optimize=True)
+        return str(out_path.resolve())
+
+    @staticmethod
+    def _card_for_prompt(card: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "source_ref": str(card.get("source_ref") or ""),
+            "region_id": str(card.get("region_id") or ""),
+            "title": str(card.get("title") or "")[:220],
+            "url": str(card.get("url") or "")[:1000],
+            "snippet": str(card.get("snippet") or "")[:320],
+            "reference_image_available": bool(card.get("reference_image_available")),
+        }
+
+    @staticmethod
+    def _identity_in_card_title(identity: str, display_name: str, card: dict[str, Any]) -> bool:
+        title = re.sub(r"\s+", "", str(card.get("title") or "")).casefold()
+        for raw in [identity, display_name]:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            variants = [name, re.sub(r"[（(].*?[）)]", "", name).strip()]
+            for variant in variants:
+                key = re.sub(r"[\s\-_/|｜・·]+", "", variant).casefold()
+                if len(key) >= 2 and key in title:
+                    return True
+        return False
+
     async def _run_multi_region_pipeline(
         self,
         *,
@@ -581,109 +986,61 @@ class VisionPipelinePlugin(Star):
         search_provider: str,
         counters: tuple[int, int, int, bool, int, int, bool, str],
     ) -> dict[str, Any]:
-        """One pipeline, many regions, with progressive retrieval.
+        """One pipeline, many regions, with region-specific search + visual web references.
 
-        The expensive Vision model is used once for primary perception and once for final
-        visual verification. Search is deliberately compact: discover the source ecosystem
-        only on cache miss, then search region-specific visual traits. We never seed discovery
-        with Primary's guessed names because that caused candidate lock-in in earlier versions.
+        v0.8 removes Search Planner / Candidate Synth from the critical path. The expensive
+        Vision model already sees the image, so Primary emits neutral search_terms. We spend
+        the Tavily budget directly on each region, then (best effort) extract representative
+        webpage images and place them beside TARGET crops in one comparison sheet.
         """
         (
             vision_calls, search_calls, reviewer_calls, search_blocked,
             animetrace_calls, animetrace_cache_hits, animetrace_blocked, grounding_path,
         ) = counters
-
         regions = list(primary.get("regions") or [])[: self._multi_region_max_regions()]
-        strong_anchors = self._strong_text_anchors(primary)
-        source_key = self._source_cache_key(strong_anchors)
-        cached_source_index = self._source_cache_get(source_key)
-        search_results: list[dict[str, Any]] = []
-        candidate_grounding: dict[str, Any] = {
-            "source_index": cached_source_index or {},
-            "regions": [],
-            "global_notes": [],
-        }
+        search_cards: list[dict[str, Any]] = []
+        search_requests = self._multi_region_search_requests(primary)
+        source_label = self._source_search_label(primary)
+        self._debug("MULTI_REGION_SEARCH_REQUESTS", search_requests)
 
-        # Progressive search plan. Primary candidate guesses are intentionally NOT passed.
-        # Cache miss: at most two searches (source-universe + region traits).
-        # Cache hit: at most one region-traits search.
-        queries: list[str] = []
-        if bool(self.config.get("strong_text_anchor_search", True)) and (
-            strong_anchors or primary.get("status") == "NEED_SEARCH"
-        ):
-            if bool(self.config.get("multi_region_search_planner", True)):
-                plan_payload = json.dumps(
-                    {
-                        "task": task,
-                        "rejected_candidates": rejected_candidates,
-                        "strong_text_anchors": strong_anchors,
-                        "source_index_cache": cached_source_index or {},
-                        "regions": self._regions_for_search(regions),
-                        "cache_hit": bool(cached_source_index),
-                    },
-                    ensure_ascii=False,
-                )
-                try:
-                    plan_data, _ = await asyncio.wait_for(
-                        self._llm_json(search_provider, MULTI_REGION_SEARCH_PLAN_SYSTEM, plan_payload),
-                        timeout=self._search_worker_timeout(),
-                    )
-                    queries = self._clean_list(plan_data.get("queries", []))
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("[vision-pipeline] multi-region search planner failed: %s", exc)
-
-            if not queries:
-                queries = self._multi_region_search_queries(primary, cached_source_index)
-
-            budget = self._multi_region_max_search_queries()
-            if cached_source_index:
-                budget = min(budget, 1)
-            for query in queries[:budget]:
-                try:
+        for req in search_requests[: self._multi_region_max_search_queries()]:
+            query = str(req.get("query") or "").strip()
+            rid = str(req.get("region_id") or "GLOBAL").strip()
+            if not query:
+                continue
+            try:
+                if bool(self.config.get("multi_region_tavily_include_images", True)):
+                    try:
+                        text = await self._direct_tavily_search_with_images(event, query)
+                    except Exception as image_search_exc:  # noqa: BLE001
+                        logger.warning(
+                            "[vision-pipeline] Tavily image-enriched search failed; fallback native search: %s",
+                            image_search_exc,
+                        )
+                        text = await self._native_tavily_search(event, query)
+                else:
                     text = await self._native_tavily_search(event, query)
-                    search_calls += 1
-                except Exception as exc:  # noqa: BLE001
-                    if self._is_rate_limited(str(exc)):
-                        search_blocked = True
-                        break
-                    logger.warning("[vision-pipeline] multi-region Tavily failed: %s", exc)
-                    continue
-                if self._is_rate_limited(text):
+                search_calls += 1
+            except Exception as exc:  # noqa: BLE001
+                if self._is_rate_limited(str(exc)):
                     search_blocked = True
                     break
-                compact = self._compact_search_text(text, max_items=3, snippet_chars=420)
-                if compact:
-                    search_results.append({"query": query[:240], "result": compact})
-
-        # One cheap synth turns snippets into compact candidate cards. Its output is intentionally
-        # small and typed; long prose is discarded during normalization.
-        if (search_results or cached_source_index) and bool(self.config.get("multi_region_candidate_synth", True)):
-            synth_payload = json.dumps(
-                {
-                    "task": task,
-                    "rejected_candidates": rejected_candidates,
-                    "strong_text_anchors": strong_anchors,
-                    "source_index_cache": cached_source_index or {},
-                    "regions": self._regions_for_search(regions),
-                    "search_results": search_results,
-                },
-                ensure_ascii=False,
-            )
-            try:
-                synth_raw, _ = await asyncio.wait_for(
-                    self._llm_json(search_provider, MULTI_REGION_SEARCH_SYNTH_SYSTEM, synth_payload),
-                    timeout=self._search_worker_timeout(),
+                logger.warning("[vision-pipeline] multi-region Tavily failed: %s", exc)
+                continue
+            if self._is_rate_limited(text):
+                search_blocked = True
+                break
+            search_cards.extend(
+                self._parse_search_cards(
+                    text,
+                    region_id=rid,
+                    query=query,
+                    source_label=source_label,
                 )
-                candidate_grounding = self._normalize_multi_candidate_grounding(synth_raw, regions)
-                if cached_source_index and not candidate_grounding.get("source_index"):
-                    candidate_grounding["source_index"] = copy.deepcopy(cached_source_index)
-                source_index = candidate_grounding.get("source_index") or {}
-                if source_key and source_index:
-                    self._source_cache_put(source_key, source_index)
-                self._debug("MULTI_REGION_GROUNDING", candidate_grounding)
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[vision-pipeline] multi-region candidate synth failed: %s", exc)
+            )
 
+        # Optional AnimeTrace remains auxiliary only. It is deliberately disabled by default
+        # for multi-object scenes because of person-count / capacity limitations.
         anime_state: dict[str, Any] = {}
         if bool(self.config.get("animetrace_multi_object_enabled", False)) and self._should_use_animetrace(primary, task):
             anime_state = await self._animetrace_recognize(images[0], rejected_candidates)
@@ -692,46 +1049,52 @@ class VisionPipelinePlugin(Star):
             animetrace_blocked = bool(anime_state.get("blocked"))
             self._debug("ANIMETRACE_MULTI_AUX", anime_state)
 
-        verify_images = list(images[:1])
-        contact_path = ""
-        if bool(self.config.get("multi_region_contact_sheet", True)) and len(regions) >= 2:
-            try:
-                contact_path = await self._build_contact_sheet(images[0], regions)
-                if contact_path:
-                    verify_images = [contact_path]
-                    grounding_path = "multi_region_contact_sheet"
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("[vision-pipeline] contact sheet build failed: %s", exc)
-
-        # Do not feed raw web snippets into the expensive final Vision model. Candidate cards plus
-        # a tiny source index are enough; this is the main v0.7 token-saving change.
-        verify_prompt = json.dumps(
-            {
-                "task": task,
-                "requested_subtasks": requested_subtasks,
-                "rejected_candidates": rejected_candidates,
-                "primary_visual_facts": {
-                    "ocr": str(primary.get("ocr") or "")[:240],
-                    "strong_text_anchors": strong_anchors,
-                    "regions": self._regions_for_search(regions),
-                },
-                "grounded_entity_candidates": candidate_grounding,
-                "animetrace_auxiliary": {
-                    "status": anime_state.get("status"),
-                    "not_confident": anime_state.get("not_confident"),
-                    "reason": anime_state.get("reason", ""),
-                    "candidates": [self._candidate_for_prompt(x) for x in (anime_state.get("candidates") or [])[:6]],
-                },
-                "instruction": (
-                    "一次性识别所有 region。先判断视觉身份，再单独记录 related_entities。"
-                    "候选池不是强制二选一；若都不符合，decision 必须是 NONE_OF_ABOVE/UNRESOLVED。"
-                    "只有候选卡里存在可核验 visual_traits，且原图至少两项独特特征吻合时才允许 high。"
-                    "来源版权只能限定生态，不能自动等于具体作品。"
-                ),
-            },
-            ensure_ascii=False,
-        )
+        reference_paths: list[str] = []
+        comparison_path = ""
         try:
+            if search_cards:
+                reference_paths = await self._attach_reference_images(search_cards)
+                self._debug("MULTI_REGION_SEARCH_CARDS", [self._card_for_prompt(x) for x in search_cards])
+            if bool(self.config.get("multi_region_contact_sheet", True)) and len(regions) >= 1:
+                if reference_paths:
+                    comparison_path = await self._build_reference_sheet(images[0], regions, search_cards)
+                    if comparison_path:
+                        grounding_path = "multi_region_visual_reference_sheet"
+                elif len(regions) >= 2:
+                    comparison_path = await self._build_contact_sheet(images[0], regions)
+                    if comparison_path:
+                        grounding_path = "multi_region_contact_sheet"
+
+            verify_images = [comparison_path] if comparison_path else list(images[:1])
+            cards_for_prompt: dict[str, list[dict[str, Any]]] = {}
+            for card in search_cards:
+                cards_for_prompt.setdefault(str(card.get("region_id") or "GLOBAL"), []).append(self._card_for_prompt(card))
+
+            verify_prompt = json.dumps(
+                {
+                    "task": task,
+                    "requested_subtasks": requested_subtasks,
+                    "rejected_candidates": rejected_candidates,
+                    "primary_visual_facts": {
+                        "ocr": str(primary.get("ocr") or "")[:240],
+                        "strong_text_anchors": self._strong_text_anchors(primary),
+                        "regions": self._regions_for_search(regions),
+                    },
+                    "grounded_search_cards": cards_for_prompt,
+                    "animetrace_auxiliary": {
+                        "status": anime_state.get("status"),
+                        "not_confident": anime_state.get("not_confident"),
+                        "reason": anime_state.get("reason", ""),
+                        "candidates": [self._candidate_for_prompt(x) for x in (anime_state.get("candidates") or [])[:4]],
+                    },
+                    "instruction": (
+                        "比较图中的 TARGET 与 WEB REF。MATCH 必须绑定该 region 的 source_ref，"
+                        "而且具体名字必须能在 source_ref 的网页标题中找到；没有可靠网页视觉参考时不要高置信。"
+                        "相关艺人/声源/同位体/剧情角色不能互相替代。搜索卡不够则 UNRESOLVED。"
+                    ),
+                },
+                ensure_ascii=False,
+            )
             multi_raw, raw = await self._llm_json(
                 vision_provider,
                 MULTI_REGION_VERIFY_SYSTEM,
@@ -739,63 +1102,81 @@ class VisionPipelinePlugin(Star):
                 image_urls=verify_images,
             )
             vision_calls += 1
-            multi = self._normalize_multi_result(multi_raw, raw, regions, primary, candidate_grounding)
+            multi = self._normalize_multi_reference_result(multi_raw, raw, regions, primary, search_cards)
             self._debug("MULTI_REGION_VERIFY", multi)
         finally:
-            if contact_path:
+            if comparison_path:
                 try:
-                    Path(contact_path).unlink(missing_ok=True)
+                    Path(comparison_path).unlink(missing_ok=True)
+                except Exception:
+                    pass
+            for path in reference_paths:
+                try:
+                    Path(path).unlink(missing_ok=True)
                 except Exception:
                     pass
 
         entities = multi.get("entities") if isinstance(multi.get("entities"), list) else []
-        if bool(self.config.get("multi_region_strict_typed_answer", True)):
-            final_answer = self._render_multi_typed_answer(entities, str((multi.get("ocr") or {}).get("text") or ""))
-        else:
-            final_answer = str(multi.get("overall_answer") or "").strip()
-        if not final_answer:
-            final_answer = self._render_multi_typed_answer(entities, str((multi.get("ocr") or {}).get("text") or ""))
+        final_answer = self._render_multi_typed_answer(
+            entities,
+            str((multi.get("ocr") or {}).get("text") or ""),
+        )
         if not final_answer:
             final_answer = "无法可靠确认图中各对象的具体身份。"
 
-        sub_conf = {"multi_object": self._normalize_confidence(multi.get("confidence"))}
+        confirmed = [e for e in entities if str(e.get("decision") or "") == "MATCH"]
+        unresolved = [e for e in entities if str(e.get("decision") or "") != "MATCH"]
+        if confirmed and not unresolved:
+            identity_status = "MULTI_CONFIRMED"
+        elif confirmed:
+            identity_status = "MULTI_PARTIAL"
+        else:
+            identity_status = "MULTI_UNCONFIRMED"
+
+        locked: dict[str, str] = {"IDENTITY_STATUS": identity_status}
+        if unresolved:
+            locked["DO_NOT_INFER_IDENTITY"] = "TRUE"
         ocr_text = str((multi.get("ocr") or {}).get("text") or primary.get("ocr") or "").strip()
-        locked: dict[str, str] = {"IDENTITY_STATUS": "MULTI"}
         if ocr_text:
             locked["OCR_EXACT"] = ocr_text
         for item in entities:
-            rid = re.sub(r"[^A-Za-z0-9_-]", "", str(item.get("region_id") or ""))[:8]
+            rid = re.sub(r"[^A-Za-z0-9_-]", "", str(item.get("region_id") or ""))[:16]
+            if not rid:
+                continue
+            if str(item.get("decision") or "") != "MATCH":
+                locked[f"ENTITY_{rid}_STATUS"] = "UNCONFIRMED"
+                continue
+            locked[f"ENTITY_{rid}_STATUS"] = "CONFIRMED"
             name = str(item.get("display_name") or item.get("visual_identity") or "").strip()
-            if rid and name and not self._is_unknown_answer(name):
+            if name:
                 locked[f"ENTITY_{rid}_EXACT"] = name
-                canonical = str(item.get("canonical_name") or "").strip()
-                if canonical:
-                    locked[f"ENTITY_{rid}_CANONICAL"] = canonical
-                etype = str(item.get("entity_type") or "").strip()
-                if etype:
-                    locked[f"ENTITY_{rid}_TYPE"] = etype
-                work = str(item.get("work") or "").strip()
-                if work:
-                    locked[f"ENTITY_{rid}_WORK"] = work
+            canonical = str(item.get("canonical_name") or "").strip()
+            if canonical:
+                locked[f"ENTITY_{rid}_CANONICAL"] = canonical
+            etype = str(item.get("entity_type") or "").strip()
+            if etype:
+                locked[f"ENTITY_{rid}_TYPE"] = etype
+            work = str(item.get("work") or "").strip()
+            if work:
+                locked[f"ENTITY_{rid}_WORK"] = work
 
-        sources = self._clean_list(multi.get("sources", []))[:4]
-        if anime_state.get("candidates") and not sources:
-            sources.append(f"AnimeTrace ({anime_state.get('model') or 'service-default'})")
-
+        meta = self._meta(
+            vision_calls, search_calls, reviewer_calls, search_blocked,
+            animetrace_calls, animetrace_cache_hits, animetrace_blocked,
+            grounding_path or "multi_region_region_search",
+        )
+        meta["search_cards"] = len(search_cards)
+        meta["reference_images"] = len(reference_paths)
         return {
             "status": "FINAL",
             "final_answer": final_answer,
             "confidence": self._normalize_confidence(multi.get("confidence")),
-            "subtask_confidence": sub_conf,
+            "subtask_confidence": {"multi_object": self._normalize_confidence(multi.get("confidence"))},
             "locked_facts": locked,
             "evidence": self._clean_list(multi.get("evidence", []))[:6],
             "uncertainty": str(multi.get("uncertainty") or "").strip(),
-            "sources": sources,
-            "meta": self._meta(
-                vision_calls, search_calls, reviewer_calls, search_blocked,
-                animetrace_calls, animetrace_cache_hits, animetrace_blocked,
-                grounding_path or "multi_region",
-            ),
+            "sources": self._clean_list(multi.get("sources", []))[:4],
+            "meta": meta,
         }
 
     def _source_cache_ttl(self) -> int:
@@ -881,6 +1262,7 @@ class VisionPipelinePlugin(Star):
                 "kind": str(row.get("kind") or "other"),
                 "label_hint": str(row.get("label_hint") or "")[:80],
                 "direct_observations": [str(x)[:120] for x in (row.get("direct_observations") or [])[:5]],
+                "search_terms": [str(x)[:60] for x in (row.get("search_terms") or [])[:5]],
                 "ocr": str(row.get("ocr") or "")[:120],
             })
         return out
@@ -1006,6 +1388,7 @@ class VisionPipelinePlugin(Star):
                     "kind": str(item.get("kind") or "other").strip(),
                     "label_hint": str(item.get("label_hint") or "").strip()[:120],
                     "direct_observations": self._clean_list(item.get("direct_observations", []))[:4],
+                    "search_terms": self._clean_list(item.get("search_terms", []))[:5],
                     "ocr": str(item.get("ocr") or "").strip()[:200],
                 }
             )
@@ -1189,6 +1572,145 @@ class VisionPipelinePlugin(Star):
             "source_index": source_index,
             "regions": out_regions,
             "global_notes": self._clean_list(data.get("global_notes", []))[:2],
+        }
+
+
+    def _normalize_multi_reference_result(
+        self,
+        data: dict[str, Any],
+        raw: str,
+        regions: list[dict[str, Any]],
+        primary: dict[str, Any],
+        search_cards: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Normalize v0.8 reference matching and aggressively sanitize unresolved guesses."""
+        valid_ids = {str(x.get("region_id") or "") for x in regions}
+        region_map = {str(x.get("region_id") or ""): x for x in regions}
+        card_map: dict[str, dict[str, dict[str, Any]]] = {}
+        for card in search_cards:
+            rid = str(card.get("region_id") or "")
+            ref = str(card.get("source_ref") or "")
+            if rid and ref:
+                card_map.setdefault(rid, {})[ref] = card
+
+        raw_entities = data.get("entities") if isinstance(data.get("entities"), list) else []
+        raw_by_region: dict[str, dict[str, Any]] = {}
+        for item in raw_entities:
+            if isinstance(item, dict):
+                rid = str(item.get("region_id") or "").strip()
+                if rid:
+                    raw_by_region[rid] = item
+
+        entities: list[dict[str, Any]] = []
+        selected_sources: list[str] = []
+        global_evidence: list[str] = []
+
+        ocr_text = str((data.get("ocr") or {}).get("text") if isinstance(data.get("ocr"), dict) else "").strip()
+        if not ocr_text:
+            ocr_text = str(primary.get("ocr") or "").strip()
+        if ocr_text:
+            global_evidence.append(f"图中文字：{ocr_text}"[:300])
+
+        for rid in [str(x.get("region_id") or "") for x in regions]:
+            if valid_ids and rid not in valid_ids:
+                continue
+            item = raw_by_region.get(rid) or {}
+            decision = str(item.get("decision") or "UNRESOLVED").strip().upper()
+            source_ref = str(item.get("source_ref") or "").strip()
+            card = (card_map.get(rid) or {}).get(source_ref)
+            canonical = str(item.get("canonical_name") or "").strip()
+            display_name = str(item.get("display_name") or canonical or "").strip()
+            visual_identity = str(item.get("visual_identity") or display_name or canonical or "").strip()
+            evidence = self._clean_list(item.get("evidence", []))[:3]
+
+            valid_match = bool(
+                decision == "MATCH"
+                and card
+                and canonical
+                and self._identity_in_card_title(canonical, display_name, card)
+            )
+
+            if not valid_match:
+                # Crucial hygiene: model-memory guesses must not survive in Evidence/related fields
+                # when the grounded match gate failed. Only direct Primary observations remain.
+                reg = region_map.get(rid) or {}
+                direct = self._clean_list(reg.get("direct_observations", []))[:3]
+                entities.append({
+                    "region_id": rid,
+                    "label": str(reg.get("label_hint") or item.get("label") or rid).strip(),
+                    "kind": str(reg.get("kind") or "other"),
+                    "decision": "UNRESOLVED",
+                    "source_ref": "",
+                    "visual_identity": "无法可靠确认",
+                    "canonical_name": "",
+                    "display_name": "",
+                    "entity_type": "unknown",
+                    "work": "",
+                    "related_entities": [],
+                    "confidence": "low",
+                    "evidence": direct,
+                })
+                continue
+
+            confidence = self._normalize_confidence(item.get("confidence"))
+            # High requires an actual downloaded reference image and two visual correspondences.
+            if confidence == "high" and (not bool(card.get("reference_image_available")) or len(evidence) < 2):
+                confidence = "medium"
+
+            rels = []
+            for rel in (item.get("related_entities") if isinstance(item.get("related_entities"), list) else [])[:3]:
+                if isinstance(rel, dict) and str(rel.get("name") or "").strip():
+                    rels.append({
+                        "relation": str(rel.get("relation") or "other").strip(),
+                        "name": str(rel.get("name") or "").strip(),
+                        "note": str(rel.get("note") or "").strip()[:160],
+                    })
+            url = str(card.get("url") or "").strip()
+            if url and url not in selected_sources:
+                selected_sources.append(url)
+            for ev in evidence[:2]:
+                if ev not in global_evidence:
+                    global_evidence.append(ev)
+
+            entities.append({
+                "region_id": rid,
+                "label": str(item.get("label") or (region_map.get(rid) or {}).get("label_hint") or rid).strip(),
+                "kind": str((region_map.get(rid) or {}).get("kind") or "other"),
+                "decision": "MATCH",
+                "source_ref": source_ref,
+                "visual_identity": visual_identity or display_name or canonical,
+                "canonical_name": canonical,
+                "display_name": display_name or canonical,
+                "entity_type": str(item.get("entity_type") or "unknown").strip(),
+                "work": str(item.get("work") or "").strip(),
+                "related_entities": rels,
+                "confidence": confidence,
+                "evidence": evidence,
+            })
+
+        order = {"low": 0, "medium": 1, "high": 2}
+        confs = [str(x.get("confidence") or "low") for x in entities]
+        overall_conf = min(confs, key=lambda x: order.get(x, 0)) if confs else "low"
+        unresolved_count = sum(1 for x in entities if x.get("decision") != "MATCH")
+        uncertainty = str(data.get("uncertainty") or "").strip()
+        if unresolved_count and not uncertainty:
+            uncertainty = f"{unresolved_count} 个区域缺少可验证的网页视觉对应，已禁止依据模型记忆补全身份。"
+
+        return {
+            "status": "FINAL",
+            "entities": entities,
+            "overall_answer": self._render_multi_typed_answer(entities, ocr_text),
+            "confidence": overall_conf,
+            "ocr": {
+                "text": ocr_text,
+                "confidence": self._normalize_confidence(
+                    ((data.get("ocr") or {}).get("confidence") if isinstance(data.get("ocr"), dict) else None)
+                    or primary.get("confidence")
+                ),
+            },
+            "evidence": global_evidence[:6],
+            "uncertainty": uncertainty,
+            "sources": selected_sources[:4],
         }
 
     def _normalize_multi_result(
@@ -1474,8 +1996,7 @@ class VisionPipelinePlugin(Star):
                         reviewer_provider,
                         FINAL_REVIEW_SYSTEM,
                         json.dumps(
-                            {
-                                "task": task,
+                            {                                "task": task,
                                 "requested_subtasks": requested_subtasks,
                                 "rejected_candidates": rejected_candidates,
                                 "primary": self._compact_primary(primary),
@@ -2230,6 +2751,88 @@ class VisionPipelinePlugin(Star):
             tool_call_timeout=int(self.config.get("tool_timeout", 45) or 45),
         )
 
+    async def _direct_tavily_search_with_images(self, event: AstrMessageEvent, query: str) -> str:
+        """Tavily search using AstrBot's configured key pool, preserving per-result images.
+
+        AstrBot v4.28.x normalizes Tavily results to title/url/snippet and drops the
+        API's `images` fields. Multi-region visual identity resolution benefits from
+        those images, so this narrow helper calls the same Tavily endpoint directly
+        while reusing the same global key list and failover semantics.
+        """
+        cfg = self.context.get_config(umo=event.unified_msg_origin)
+        ps = cfg.get("provider_settings", {})
+        if not ps.get("web_search", False) or ps.get("websearch_provider") != "tavily":
+            raise RuntimeError("AstrBot 原生网页搜索未启用或当前 provider 不是 tavily。")
+        keys = ps.get("websearch_tavily_key", [])
+        if isinstance(keys, str):
+            keys = [keys] if keys else []
+        keys = [str(k).strip() for k in keys if str(k).strip()]
+        if not keys:
+            raise RuntimeError("AstrBot 未配置 Tavily API Key。")
+
+        async with self._tavily_key_lock:
+            start = self._tavily_key_index % len(keys)
+            self._tavily_key_index = (self._tavily_key_index + 1) % len(keys)
+
+        payload = {
+            "query": query,
+            "max_results": int(self.config.get("tavily_max_results", 5) or 5),
+            "search_depth": str(self.config.get("tavily_search_depth", "basic") or "basic"),
+            "topic": "general",
+            "include_answer": False,
+            "include_raw_content": False,
+            "include_images": True,
+            "include_image_descriptions": True,
+        }
+        session = await self._ensure_http_session()
+        timeout_s = max(8, min(45, int(self.config.get("tool_timeout", 45) or 45)))
+        last_error: Exception | None = None
+        retryable = {401, 403, 429, 432}
+        for offset in range(len(keys)):
+            key = keys[(start + offset) % len(keys)]
+            try:
+                async with session.post(
+                    "https://api.tavily.com/search",
+                    json=payload,
+                    headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                    timeout=aiohttp.ClientTimeout(total=timeout_s),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        # Keep only fields the pipeline uses and cap image counts/context.
+                        rows = []
+                        for row in list(data.get("results") or [])[: max(1, int(payload["max_results"]))]:
+                            if not isinstance(row, dict):
+                                continue
+                            images = []
+                            for raw_img in list(row.get("images") or [])[:6]:
+                                if isinstance(raw_img, str):
+                                    images.append({"url": raw_img, "description": ""})
+                                elif isinstance(raw_img, dict):
+                                    images.append({
+                                        "url": str(raw_img.get("url") or "")[:1600],
+                                        "description": str(raw_img.get("description") or "")[:240],
+                                    })
+                            rows.append({
+                                "title": str(row.get("title") or "")[:300],
+                                "url": str(row.get("url") or "")[:1600],
+                                "snippet": str(row.get("content") or "")[:700],
+                                "images": images,
+                            })
+                        return json.dumps({"results": rows}, ensure_ascii=False)
+                    reason = await resp.text()
+                    err = RuntimeError(f"Tavily web search failed: {reason}, status: {resp.status}")
+                    if resp.status in retryable:
+                        last_error = err
+                        continue
+                    raise err
+            except (asyncio.TimeoutError, aiohttp.ClientError) as exc:
+                last_error = RuntimeError(f"Tavily image-enriched search transport error: {type(exc).__name__}")
+                continue
+        if last_error:
+            raise last_error
+        raise RuntimeError("Tavily image-enriched search failed with all configured keys.")
+
     async def _native_tavily_search(self, event: AstrMessageEvent, query: str) -> str:
         cfg = self.context.get_config(umo=event.unified_msg_origin)
         ps = cfg.get("provider_settings", {})
@@ -2392,8 +2995,7 @@ class VisionPipelinePlugin(Star):
             "answer": str(identity_raw.get("answer") or "").strip(),
             "canonical_name": str(identity_raw.get("canonical_name") or "").strip(),
             "display_name": str(identity_raw.get("display_name") or "").strip(),
-            "work": str(identity_raw.get("work") or "").strip(),
-            "confidence": self._normalize_confidence(identity_raw.get("confidence")),
+            "work": str(identity_raw.get("work") or "").strip(),            "confidence": self._normalize_confidence(identity_raw.get("confidence")),
         }
         if "identity" in requested_subtasks and not identity["answer"]:
             identity["answer"] = "无法可靠确认具体身份。" if not selected else ""
@@ -2870,7 +3472,14 @@ class VisionPipelinePlugin(Star):
         locked = result.get("locked_facts")
         if isinstance(locked, dict) and locked:
             lines.append("LOCKED_FACTS:")
-            for key in ["IMAGE_STATUS", "IDENTITY_STATUS", "IDENTITY_EXACT", "IDENTITY_CANONICAL", "WORK_EXACT", "OCR_EXACT"]:
+            priority = ["IMAGE_STATUS", "IDENTITY_STATUS", "DO_NOT_INFER_IDENTITY", "IDENTITY_EXACT", "IDENTITY_CANONICAL", "WORK_EXACT", "OCR_EXACT"]
+            emitted = set()
+            for key in priority:
+                value = str(locked.get(key) or "").strip()
+                if value:
+                    lines.append(f"{key}: {value}")
+                    emitted.add(key)
+            for key in sorted(k for k in locked if k not in emitted):
                 value = str(locked.get(key) or "").strip()
                 if value:
                     lines.append(f"{key}: {value}")
@@ -2896,8 +3505,9 @@ class VisionPipelinePlugin(Star):
         else:
             lines.append(
                 "INSTRUCTION_TO_MAIN: 直接回答用户。LOCKED_FACTS 属于代码锁定事实，引用时必须逐字复制，"
-                "不得纠错、同义改写或重新识别；若 IDENTITY_STATUS=UNCONFIRMED，严禁从 EVIDENCE/候选中"
-                "自行推断具体身份；不要重复执行内部搜索。"
+                "不得纠错、同义改写或重新识别；若 IDENTITY_STATUS 含 UNCONFIRMED/PARTIAL，或存在 "
+                "DO_NOT_INFER_IDENTITY=TRUE / 任一 ENTITY_*_STATUS=UNCONFIRMED，严禁从 EVIDENCE、related_entities、"
+                "候选或模型记忆中补出具体身份；不要重复执行内部搜索。"
             )
         return "\n".join(lines)
 
