@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.8.0
+
+- Multi-Region 关键路径移除 Search Planner + Candidate Synth 两次文本 LLM；Primary Vision 直接输出不含候选名的 `search_terms`，插件把网页预算直接花在各 region 上。
+- 修复 v0.7 实测的 Candidate Synth 超时：搜索整理不再依赖该 Worker，因此其超时不再导致空候选池。
+- 默认两人物图按 region 各做一次开放检索；不再每轮先重建完整企划背景。
+- 新增 Tavily `include_images` 视觉参考：复用 AstrBot 全局 Tavily 多 Key，并对 401/403/429/432 做 failover；失败自动回退 AstrBot 原生 Tavily。
+- 搜索结果直接生成短 Search Card（source_ref/title/url/snippet），不再经过自由长篇 Candidate Synth。
+- 新增网页视觉参考：优先使用 Tavily 搜索结果绑定图片，否则提取页面 og:image / twitter:image / 主图；TARGET 与 WEB REF 拼成单张 Reference Sheet。
+- Final Multi-Region Vision 改为 `MATCH | UNRESOLVED`；MATCH 必须绑定同 region 的 source_ref。
+- 代码级 grounding gate 要求具体 identity 能在选中 Search Card 的网页标题中找到；snippet 中只出现的声源/原型/相关人物不能冒充 visual identity。
+- high confidence 需要实际网页参考图 + 至少两项视觉对应；纯文字关系证据最高 medium。
+- UNRESOLVED 执行严格证据清洗：删除模型猜出的身份、作品、related_entities 与实体主张，只保留 Primary 直接视觉观察。
+- LOCKED_FACTS 增加 `MULTI_CONFIRMED / MULTI_PARTIAL / MULTI_UNCONFIRMED`、逐 region STATUS，以及 `DO_NOT_INFER_IDENTITY=TRUE`，防止 Main 从 Evidence 二次猜身份。
+
 ## v0.7.0
 
 - Multi-Region search switched from `guess -> verify guesses` to progressive `source ecosystem -> region visual candidates -> verify`.
